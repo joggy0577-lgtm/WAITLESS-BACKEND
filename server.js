@@ -24,7 +24,7 @@ const rateLimit = require("express-rate-limit");
 // ── Firebase Admin Init ───────────────────────────────────────────────────────
 // Download your service account key from:
 // Firebase Console → Project Settings → Service Accounts → Generate new private key
-const serviceAccount = require("./serviceAccountKey.json"); // ADD YOUR FILE HERE
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT); // ADD YOUR FILE HERE
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
