@@ -1,30 +1,22 @@
 /**
  * Waitless — Backend Server (Node.js + Express)
  * ─────────────────────────────────────────────
- * This server handles:
- *   • Firebase Admin SDK for server-side auth verification
- *   • REST API routes (optional layer on top of direct Firestore)
- *   • Webhook / notification endpoints
- *
- * NOTE: The app largely uses Firebase Firestore's real-time listeners
- * directly from the frontend. This backend adds an extra security layer
- * and can be used for server-side operations / future extensions.
- *
- * Setup:
- *   1. npm install
- *   2. Add your Firebase service account JSON (see below)
- *   3. node server.js
+ * Fixes in this version:
+ *   • startTime is now optional (was incorrectly required)
+ *   • totalTokens validation handles undefined/NaN safely
+ *   • "notstarted" added to valid statuses
+ *   • doctorName reads from correct Firebase token field
+ *   • CORS now allows ALL origins (open API for any device/domain)
+ *   • Appointment created with status "notstarted" by default
  */
 
-const express = require("express");
-const cors = require("cors");
-const admin = require("firebase-admin");
+const express  = require("express");
+const cors     = require("cors");
+const admin    = require("firebase-admin");
 const rateLimit = require("express-rate-limit");
 
 // ── Firebase Admin Init ───────────────────────────────────────────────────────
-// Download your service account key from:
-// Firebase Console → Project Settings → Service Accounts → Generate new private key
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT); // ADD YOUR FILE HERE
+const serviceAccount = require("./serviceAccountKey.json");
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -33,21 +25,15 @@ admin.initializeApp({
 const db = admin.firestore();
 
 // ── Express Setup ─────────────────────────────────────────────────────────────
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors({
-  origin: [
-    "https://joggy0577-lgtm.github.io",
-    "http://localhost:3000"
-  ],
-  methods: ["GET","POST","PATCH","DELETE"],
-  allowedHeaders: ["Content-Type","Authorization"]
-}));
+// Allow ALL origins so any device / domain can reach the API
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// Rate limiting — prevent abuse
-const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+// Rate limiting
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200 });
 app.use(limiter);
 
 // ── Middleware: Verify Firebase ID Token ──────────────────────────────────────
@@ -64,6 +50,10 @@ async function verifyToken(req, res, next) {
   }
 }
 
+// ── Valid statuses ────────────────────────────────────────────────────────────
+// "notstarted" = session created but doctor hasn't begun serving yet
+const VALID_STATUSES = ["notstarted", "normal", "emergency", "nopatient", "break"];
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // Health check
@@ -78,7 +68,6 @@ app.get("/api/appointments", async (req, res) => {
       .collection("appointments")
       .where("active", "==", true)
       .get();
-
     const appointments = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
     res.json({ appointments });
   } catch (e) {
@@ -90,8 +79,7 @@ app.get("/api/appointments", async (req, res) => {
 // ── PUBLIC: Get single appointment ───────────────────────────────────────────
 app.get("/api/appointments/:id", async (req, res) => {
   try {
-    const docRef = db.collection("appointments").doc(req.params.id);
-    const snap = await docRef.get();
+    const snap = await db.collection("appointments").doc(req.params.id).get();
     if (!snap.exists) return res.status(404).json({ error: "Not found" });
     res.json({ id: snap.id, ...snap.data() });
   } catch (e) {
@@ -100,16 +88,19 @@ app.get("/api/appointments/:id", async (req, res) => {
 });
 
 // ── DOCTOR: Create appointment ────────────────────────────────────────────────
-// One active appointment per doctor enforced server-side
 app.post("/api/appointments", verifyToken, async (req, res) => {
   const { title, startTime, totalTokens, notes } = req.body;
 
-  if (!title || !startTime) {
-    return res.status(400).json({ error: "title and startTime are required" });
+  // Only title is required — startTime is optional display info
+  if (!title || !title.trim()) {
+    return res.status(400).json({ error: "title is required" });
   }
-  if (totalTokens < 1 || totalTokens > 500) {
-    return res.status(400).json({ error: "totalTokens must be between 1–500" });
-  }
+
+  // Safe token count parsing — default 20 if missing/invalid
+  const tokenCount = Number(totalTokens);
+  const safeTokens = (!tokenCount || isNaN(tokenCount))
+    ? 20
+    : Math.min(Math.max(Math.floor(tokenCount), 1), 500);
 
   try {
     // Enforce: one active appointment per doctor
@@ -121,75 +112,79 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
 
     if (!existing.empty) {
       return res.status(409).json({
-        error: "You already have an active appointment session. End it before creating a new one.",
+        error: "You already have an active session. End it before creating a new one.",
       });
     }
 
+    // Firebase token fields: display_name (Admin SDK) or name (standard JWT)
+    const doctorName  = req.user.display_name || req.user.name || "Doctor";
+    const doctorPhoto = req.user.picture || "";
+
     const docRef = db.collection("appointments").doc();
     const appointment = {
-      doctorId: req.user.uid,
-      doctorName: req.user.name || "Doctor",
-      doctorPhoto: req.user.picture || "",
-      title,
-      startTime,
-      totalTokens: Number(totalTokens),
+      doctorId:     req.user.uid,
+      doctorName:   doctorName,
+      doctorPhoto:  doctorPhoto,
+      title:        title.trim(),
+      startTime:    startTime || "",       // optional — empty string if not provided
+      totalTokens:  safeTokens,
       currentToken: 1,
-      status: "normal",        // normal | emergency | nopatient | break
-      instruction: "",
-      active: true,
-      notes: notes || "",
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      status:       "notstarted",          // doctor must click Start to begin
+      instruction:  "",
+      active:       true,
+      notes:        notes ? String(notes).trim() : "",
+      createdAt:    admin.firestore.FieldValue.serverTimestamp(),
     };
 
     await docRef.set(appointment);
+
+    // Return the id so frontend can use it immediately
     res.status(201).json({ id: docRef.id, ...appointment });
   } catch (e) {
-    console.error(e);
+    console.error("Create appointment error:", e);
     res.status(500).json({ error: "Failed to create appointment" });
   }
 });
 
-// ── DOCTOR: Update appointment (token control, status, instruction) ──────────
+// ── DOCTOR: Update appointment (token, status, instruction) ──────────────────
 app.patch("/api/appointments/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
   const { status, currentToken, instruction } = req.body;
 
   try {
     const docRef = db.collection("appointments").doc(id);
-    const snap = await docRef.get();
+    const snap   = await docRef.get();
 
     if (!snap.exists) return res.status(404).json({ error: "Not found" });
 
     const data = snap.data();
 
-    // Only the owner doctor can update
     if (data.doctorId !== req.user.uid) {
       return res.status(403).json({ error: "Forbidden: Not your appointment" });
     }
 
     const updates = {};
 
-    // Status update
-    const validStatuses = ["normal", "emergency", "nopatient", "break"];
+    // Status — now includes "notstarted" in the valid list
     if (status !== undefined) {
-      if (!validStatuses.includes(status)) {
-        return res.status(400).json({ error: "Invalid status" });
+      if (!VALID_STATUSES.includes(status)) {
+        return res.status(400).json({ error: `Invalid status. Must be one of: ${VALID_STATUSES.join(", ")}` });
       }
       updates.status = status;
     }
 
-    // Token update
+    // Token navigation
     if (currentToken !== undefined) {
       const token = Number(currentToken);
-      if (token < 1 || token > data.totalTokens) {
+      if (isNaN(token) || token < 1 || token > data.totalTokens) {
         return res.status(400).json({ error: "currentToken out of range" });
       }
       updates.currentToken = token;
     }
 
-    // Instruction broadcast
+    // Broadcast instruction
     if (instruction !== undefined) {
-      updates.instruction = String(instruction).slice(0, 300); // max 300 chars
+      updates.instruction = String(instruction).slice(0, 300);
     }
 
     updates.updatedAt = admin.firestore.FieldValue.serverTimestamp();
@@ -197,7 +192,7 @@ app.patch("/api/appointments/:id", verifyToken, async (req, res) => {
 
     res.json({ success: true, updates });
   } catch (e) {
-    console.error(e);
+    console.error("Update appointment error:", e);
     res.status(500).json({ error: "Failed to update appointment" });
   }
 });
@@ -208,7 +203,7 @@ app.delete("/api/appointments/:id", verifyToken, async (req, res) => {
 
   try {
     const docRef = db.collection("appointments").doc(id);
-    const snap = await docRef.get();
+    const snap   = await docRef.get();
 
     if (!snap.exists) return res.status(404).json({ error: "Not found" });
     if (snap.data().doctorId !== req.user.uid) {
@@ -216,12 +211,13 @@ app.delete("/api/appointments/:id", verifyToken, async (req, res) => {
     }
 
     await docRef.update({
-      active: false,
+      active:  false,
       endedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     res.json({ success: true, message: "Session ended." });
   } catch (e) {
+    console.error("End session error:", e);
     res.status(500).json({ error: "Failed to end session" });
   }
 });
@@ -246,6 +242,8 @@ app.get("/api/my-appointment", verifyToken, async (req, res) => {
 // ── Start Server ──────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`\n🚀 Waitless backend running on http://localhost:${PORT}\n`);
+  console.log(`   CORS: open (all origins allowed)`);
+  console.log(`   Valid statuses: ${VALID_STATUSES.join(", ")}\n`);
 });
 
 module.exports = app;
