@@ -36,7 +36,14 @@ const db = admin.firestore();
 const app = express();
 const PORT = process.env.PORT || 4000;
 
-app.use(cors({ origin: process.env.FRONTEND_URL || "http://localhost:3000" }));
+app.use(cors({
+  origin: [
+    "https://joggy0577-lgtm.github.io",
+    "http://localhost:3000"
+  ],
+  methods: ["GET","POST","PATCH","DELETE"],
+  allowedHeaders: ["Content-Type","Authorization"]
+}));
 app.use(express.json());
 
 // Rate limiting — prevent abuse
