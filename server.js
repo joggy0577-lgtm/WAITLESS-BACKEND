@@ -122,18 +122,20 @@ app.post("/api/appointments", verifyToken, async (req, res) => {
 
     const docRef = db.collection("appointments").doc();
     const appointment = {
-      doctorId:     req.user.uid,
-      doctorName:   doctorName,
-      doctorPhoto:  doctorPhoto,
-      title:        title.trim(),
-      startTime:    startTime || "",       // optional — empty string if not provided
-      totalTokens:  safeTokens,
-      currentToken: 1,
-      status:       "notstarted",          // doctor must click Start to begin
-      instruction:  "",
-      active:       true,
-      notes:        notes ? String(notes).trim() : "",
-      createdAt:    admin.firestore.FieldValue.serverTimestamp(),
+      doctorId:          req.user.uid,
+      doctorName:        doctorName,
+      doctorPhoto:       doctorPhoto,
+      doctorWaitlessId:  req.body.doctorWaitlessId ? String(req.body.doctorWaitlessId).slice(0,20) : "",
+      title:             title.trim(),
+      startTime:         startTime || "",
+      totalTokens:       safeTokens,
+      currentToken:      1,
+      status:            "notstarted",
+      instruction:       "",
+      active:            true,
+      notes:             notes ? String(notes).trim() : "",
+      location:          req.body.location ? String(req.body.location).slice(0,100) : "",
+      createdAt:         admin.firestore.FieldValue.serverTimestamp(),
     };
 
     await docRef.set(appointment);
